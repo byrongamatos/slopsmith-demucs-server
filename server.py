@@ -23,7 +23,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, File, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -157,6 +157,192 @@ async def separate_url(
     result = _enqueue_job(job_id, tmp.name, stem_list, use_model)
     if result.get("error"):
         return JSONResponse(result, 503)
+    return result
+
+
+# ── Whisper forced alignment ───────────────────────────────────────────
+
+# Lazy-loaded stable-ts model (shared across requests).
+_align_model = None
+_align_model_lock = threading.Lock()
+_align_model_name = "medium"
+
+
+def _get_align_model():
+    global _align_model
+    if _align_model is None:
+        with _align_model_lock:
+            if _align_model is None:
+                import stable_whisper
+                _align_model = stable_whisper.load_model(
+                    _align_model_name,
+                    device=_device or ("cuda" if _gpu_available else "cpu"),
+                )
+    return _align_model
+
+
+def _get_hyphenator(lang_code: str):
+    """Get a pyphen hyphenator for the given language, with fallback to English."""
+    import pyphen
+    # Map common Whisper language codes to pyphen locale codes
+    lang_map = {
+        "en": "en_US", "es": "es_ES", "fr": "fr_FR", "de": "de_DE",
+        "it": "it_IT", "pt": "pt_PT", "nl": "nl_NL", "ru": "ru_RU",
+        "ja": "en_US", "ko": "en_US", "zh": "en_US",  # CJK: no hyphenation, 1 char = 1 syllable
+        "sv": "sv_SE", "da": "da_DK", "nb": "nb_NO", "fi": "fi_FI",
+        "pl": "pl_PL", "cs": "cs_CZ", "hu": "hu_HU", "ro": "ro_RO",
+    }
+    locale = lang_map.get(lang_code, "")
+    if not locale:
+        # Try constructing a locale from the code
+        locale = f"{lang_code}_{lang_code.upper()}" if lang_code else "en_US"
+    try:
+        return pyphen.Pyphen(lang=locale)
+    except Exception:
+        return pyphen.Pyphen(lang="en_US")
+
+
+def _syllabify(word: str, hyphenator) -> list[str]:
+    """Split a word into syllables using hyphenation. Falls back to the whole word."""
+    if not word:
+        return [word]
+    # For CJK characters, each character is roughly one syllable
+    if any('\u4e00' <= c <= '\u9fff' or '\u3040' <= c <= '\u30ff'
+           or '\uac00' <= c <= '\ud7af' for c in word):
+        return list(word)
+    parts = hyphenator.inserted(word).split('-')
+    return parts if parts else [word]
+
+
+def _detect_language(result) -> str:
+    """Try to extract the detected language from a stable-ts result."""
+    try:
+        lang = getattr(result, 'language', '')
+        return lang if lang else "en"
+    except Exception:
+        return "en"
+
+
+def _split_word_into_syllables(word_seg: dict, hyphenator) -> list[dict]:
+    """Split a word segment into syllable segments with proportional timing."""
+    syllables = _syllabify(word_seg["text"], hyphenator)
+    if len(syllables) <= 1:
+        return [word_seg]
+    total_chars = sum(len(s) for s in syllables)
+    if total_chars == 0:
+        return [word_seg]
+    duration = word_seg["end"] - word_seg["start"]
+    result = []
+    t = word_seg["start"]
+    for syl in syllables:
+        s_dur = duration * (len(syl) / total_chars)
+        result.append({
+            "start": round(t, 3),
+            "end": round(t + s_dur, 3),
+            "text": syl,
+        })
+        t += s_dur
+    return result
+
+
+@app.post("/align")
+async def align_lyrics(
+    file: UploadFile = File(...),
+    text: str = Form(...),
+    language: str = Form(""),
+    granularity: str = Form("line"),
+):
+    """Forced-align plain text lyrics against an audio file using Whisper.
+
+    Returns a JSON array of {start, end, text} per line (or word).
+    """
+    # Save upload to temp file
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename or "audio.ogg").suffix)
+    content = await file.read()
+    tmp.write(content)
+    tmp.close()
+
+    def _do_align():
+        try:
+            model = _get_align_model()
+            # stable-ts 2.19+ requires a language — default to English
+            lang = language if language else "en"
+
+            # align() with the user's text for all granularities.
+            # Extracts line-level or word-level from the same result.
+            result = model.align(tmp.name, text, language=lang)
+            result_dict = result.to_dict()
+
+            segments = []
+            if granularity in ("word", "syllable"):
+                # Extract words per segment, then smooth zero-duration
+                # timestamps within each line. align() gives accurate
+                # segment boundaries but often collapses word timestamps.
+                for seg in result_dict.get("segments", []):
+                    seg_start = seg["start"]
+                    seg_end = seg["end"]
+                    words = []
+                    for w in seg.get("words", []):
+                        wt = w.get("word", "").strip()
+                        if wt:
+                            words.append(wt)
+
+                    if not words:
+                        continue
+
+                    # Distribute words across the segment proportionally
+                    total_chars = sum(len(w) for w in words)
+                    seg_dur = seg_end - seg_start
+                    t = seg_start
+                    first = True
+                    for w in words:
+                        w_dur = seg_dur * (len(w) / total_chars) if total_chars else seg_dur / len(words)
+                        entry = {
+                            "start": round(t, 3),
+                            "end": round(t + w_dur, 3),
+                            "text": w,
+                        }
+                        if first:
+                            entry["new_line"] = True
+                            first = False
+                        segments.append(entry)
+                        t += w_dur
+
+                if granularity == "syllable":
+                    lang_code = language or "en"
+                    hyphenator = _get_hyphenator(lang_code)
+                    syllable_segs = []
+                    for ws in segments:
+                        syls = _split_word_into_syllables(ws, hyphenator)
+                        if ws.get("new_line") and syls:
+                            syls[0]["new_line"] = True
+                        syllable_segs.extend(syls)
+                    segments = syllable_segs
+            else:
+                for seg in result_dict.get("segments", []):
+                    seg_text = seg.get("text", "").strip()
+                    if seg_text:
+                        segments.append({
+                            "start": round(seg["start"], 3),
+                            "end": round(seg["end"], 3),
+                            "text": seg_text,
+                        })
+
+            return {"segments": segments}
+        except Exception as e:
+            return {"error": str(e)}
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+
+    import asyncio
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, _do_align)
+
+    if "error" in result:
+        return JSONResponse(result, 500)
     return result
 
 

@@ -3,3 +3,5 @@ uvicorn[standard]>=0.23.0
 python-multipart>=0.0.6
 demucs>=4.0.0
 torch>=2.0.0
+stable-ts>=2.0.0
+pyphen>=0.14.0
